@@ -20,12 +20,138 @@ import wave
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import pyroomacoustics as pra
 from io import BytesIO
 from PIL import Image as PILImage
 import logging # Added for logging constants
 
 # Import Module base class
 from main import Module
+
+# Helper classes (JumpToWindow, PlaylistEditor, EffectsDialog)
+# Their parent will be the top-level window of the module's frame
+
+class EffectsDialog(tk.Toplevel):
+    def __init__(self, video_player_module):
+        super().__init__(video_player_module.frame.winfo_toplevel())
+        self.master_player = video_player_module
+        self.title("音訊效果設定")
+        self.geometry("600x750") # Adjusted size for more controls
+        self.transient(video_player_module.frame.winfo_toplevel())
+        self.grab_set()
+
+        self.effect_vars = {} # To store StringVars/BooleanVars etc.
+
+        main_frame = ttk.Frame(self, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # --- Simulate Recording Device ---
+        device_frame = ttk.LabelFrame(main_frame, text="模擬收音裝置", padding="10")
+        device_frame.pack(fill=tk.X, pady=5)
+        self.effect_vars["device_sim"] = tk.StringVar(value=self.master_player.effect_settings.get("device_sim", "無"))
+        device_options = ["無", "手機", "筆電", "錄音筆", "會議麥克風"]
+        ttk.Label(device_frame, text="選擇裝置:").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Combobox(device_frame, textvariable=self.effect_vars["device_sim"], values=device_options, state="readonly", width=20).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # --- Echo Cancellation & Noise Reduction ---
+        processing_frame = ttk.LabelFrame(main_frame, text="音訊處理", padding="10")
+        processing_frame.pack(fill=tk.X, pady=5)
+        self.effect_vars["echo_cancellation"] = tk.BooleanVar(value=self.master_player.effect_settings.get("echo_cancellation", False))
+        ttk.Checkbutton(processing_frame, text="回音消除", variable=self.effect_vars["echo_cancellation"]).pack(side=tk.LEFT, padx=5)
+        self.effect_vars["noise_reduction"] = tk.BooleanVar(value=self.master_player.effect_settings.get("noise_reduction", False))
+        ttk.Checkbutton(processing_frame, text="降噪", variable=self.effect_vars["noise_reduction"]).pack(side=tk.LEFT, padx=5)
+
+        # --- Equalizer ---
+        eq_dialog_frame = ttk.LabelFrame(main_frame, text="等化器", padding="10")
+        eq_dialog_frame.pack(fill=tk.X, pady=5)
+
+        eq_options = list(EQ_PRESETS.keys())
+        self.effect_vars["eq_mode"] = tk.StringVar(value=self.master_player.effect_settings.get("eq_mode", "無"))
+
+        eq_controls_frame = ttk.Frame(eq_dialog_frame)
+        eq_controls_frame.pack(fill=tk.X)
+        ttk.Label(eq_controls_frame, text="預設:").pack(side=tk.LEFT, padx=(0,5))
+        self.eq_menu_dialog = ttk.Combobox(eq_controls_frame, values=eq_options, textvariable=self.effect_vars["eq_mode"], state="readonly", width=15)
+        self.eq_menu_dialog.pack(side=tk.LEFT, padx=5)
+        self.eq_menu_dialog.bind("<<ComboboxSelected>>", self.on_dialog_eq_mode_change)
+
+        self.eq_canvas_dialog_label = ttk.Label(eq_dialog_frame) # Use ttk.Label for consistency
+        self.eq_canvas_dialog_label.pack(pady=5)
+        self.eq_image_dialog = None # To hold PhotoImage reference for dialog
+        self.draw_dialog_equalizer_visualization()
+
+
+        # --- Playback Environment ---
+        env_frame = ttk.LabelFrame(main_frame, text="播放器環境", padding="10")
+        env_frame.pack(fill=tk.X, pady=5)
+        self.effect_vars["environment_sim"] = tk.StringVar(value=self.master_player.effect_settings.get("environment_sim", "無"))
+        env_options = ["無", "小房間", "浴室", "教室", "音樂廳", "廢棄廠房", "錄音室", "會議室", "地下道", "劇場前排", "戶外", "車內", "購物中心中庭"]
+        ttk.Label(env_frame, text="選擇環境:").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Combobox(env_frame, textvariable=self.effect_vars["environment_sim"], values=env_options, state="readonly", width=20).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # --- Place Player ---
+        placement_frame = ttk.LabelFrame(main_frame, text="播放器放置位置", padding="10")
+        placement_frame.pack(fill=tk.X, pady=5)
+        self.effect_vars["player_placement"] = tk.StringVar(value=self.master_player.effect_settings.get("player_placement", "無"))
+        placement_options = ["無", "前方", "後方", "上方", "下方", "左方", "右方", "360度環繞"]
+        ttk.Label(placement_frame, text="選擇位置:").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Combobox(placement_frame, textvariable=self.effect_vars["player_placement"], values=placement_options, state="readonly", width=20).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # --- OK and Cancel Buttons ---
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(button_frame, text="取消", command=self.destroy).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(button_frame, text="確定", command=self.confirm_effects).pack(side=tk.RIGHT)
+
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+    def draw_dialog_equalizer_visualization(self):
+        # This is similar to the main player's draw_equalizer_visualization
+        # but uses the dialog's specific variable and canvas.
+        gains = get_equalizer_gains(self.effect_vars["eq_mode"].get())
+        band_centers = [int((low * high) ** 0.5) for (low, high) in EQ_BANDS]
+
+        def fmt_freq(f):
+            return f"{f//1000}kHz" if f >= 1000 else f"{f}Hz"
+        xtick_labels = [fmt_freq(f) for f in band_centers]
+
+        fig, ax = plt.subplots(figsize=(5, 2.5), dpi=80) # Slightly smaller for dialog
+        ax.bar(range(len(band_centers)), gains, width=0.7, color="#4A90E2")
+        ax.set_xticks(range(len(band_centers)))
+        ax.set_xticklabels(xtick_labels, rotation=0, ha='center', fontsize=8)
+        ax.set_ylim(-8, 8)
+        ax.set_ylabel("dB")
+        # ax.set_xlabel("Frequency Bands") # Removed to save space
+        ax.set_title("Equalizer Preview")
+        plt.tight_layout(pad=0.2)
+
+        buf = BytesIO()
+        plt.savefig(buf, format='png')
+        plt.close(fig)
+        buf.seek(0)
+        img = PILImage.open(buf)
+        self.eq_image_dialog = ImageTk.PhotoImage(img)
+
+        if self.eq_canvas_dialog_label and self.eq_canvas_dialog_label.winfo_exists():
+            self.eq_canvas_dialog_label.config(image=self.eq_image_dialog)
+        buf.close()
+
+    def on_dialog_eq_mode_change(self, event=None):
+        self.draw_dialog_equalizer_visualization()
+
+    def confirm_effects(self):
+        # Store selected effects back to the master player
+        new_settings = {
+            "device_sim": self.effect_vars["device_sim"].get(),
+            "echo_cancellation": self.effect_vars["echo_cancellation"].get(),
+            "noise_reduction": self.effect_vars["noise_reduction"].get(),
+            "eq_mode": self.effect_vars["eq_mode"].get(),
+            "environment_sim": self.effect_vars["environment_sim"].get(),
+            "player_placement": self.effect_vars["player_placement"].get(),
+        }
+        self.master_player.apply_new_effect_settings(new_settings)
+        self.destroy()
+
 
 # Helper classes (JumpToWindow, PlaylistEditor)
 # Their parent will be the top-level window of the module's frame
@@ -217,35 +343,61 @@ def get_equalizer_gains(mode):
 def db_to_gain(db):
     return 10 ** (db / 20)
 
-def apply_equalizer(wav_path, out_path, gains):
-    with wave.open(wav_path, 'rb') as wf:
-        params = wf.getparams()
-        n_channels, sampwidth, framerate, n_frames = params[:4]
-        audio = wf.readframes(n_frames)
-        dtype = np.int16 if sampwidth == 2 else np.uint8
-        data = np.frombuffer(audio, dtype=dtype)
-        if n_channels == 2:
-            data = data.reshape(-1, 2)
-        else:
-            data = data.reshape(-1, 1)
-        data = data.astype(np.float32)
-        eq_data = np.zeros_like(data)
-        for i, (low, high) in enumerate(EQ_BANDS):
-            gain = db_to_gain(gains[i])
-            # 設定 bandpass 濾波器
-            b, a = scipy.signal.butter(2, [low/(framerate/2), high/(framerate/2)], btype='band')
-            for ch in range(n_channels):
-                filtered = scipy.signal.lfilter(b, a, data[:, ch])
-                eq_data[:, ch] += filtered * gain
-        # 正規化
-        max_val = np.max(np.abs(eq_data))
-        if max_val > 0:
-            eq_data = eq_data * (32767.0 / max_val)
-        eq_data = np.clip(eq_data, -32768, 32767).astype(np.int16)
-        eq_data_bytes = eq_data.tobytes()
-        with wave.open(out_path, 'wb') as wf_out:
-            wf_out.setparams(params)
-            wf_out.writeframes(eq_data_bytes)
+def apply_equalizer_np(audio_data_np, framerate, n_channels, gains):
+    """
+    Applies equalizer to audio data provided as a NumPy array.
+    audio_data_np: float32 NumPy array, samples between -1.0 and 1.0.
+    framerate: Sample rate of the audio.
+    n_channels: Number of audio channels.
+    gains: List of gains in dB for each EQ band.
+    Returns processed NumPy array (float32).
+    """
+    if not np.any(gains): # If all gains are zero, no EQ needed
+        return audio_data_np
+
+    eq_data = np.zeros_like(audio_data_np)
+
+    # Ensure audio_data_np is in the expected shape (samples, channels)
+    if n_channels == 1 and len(audio_data_np.shape) == 1:
+        audio_data_np = audio_data_np[:, np.newaxis] # Convert to (samples, 1)
+    elif n_channels == 2 and len(audio_data_np.shape) == 1: # Should not happen with to_soundarray
+        # This case needs careful handling if stereo is interleaved in a 1D array
+        # Assuming to_soundarray gives (samples, channels)
+        pass
+
+    for i, (low, high) in enumerate(EQ_BANDS):
+        gain_val = db_to_gain(gains[i])
+        if gain_val == 1.0: # No gain change for this band
+            # For bands with no gain change, we should add the original signal component
+            # This requires a more sophisticated filter bank approach or careful summing.
+            # Simplified: if gain is 1, that component is passed through.
+            # A simple summation of filtered bands might not be ideal without proper band splitting.
+            # For now, this approach is similar to the original but on float data.
+            # A true graphic EQ might pass all bands through filters and then sum.
+            # This implementation filters and sums, applying gain. If gain is 0dB (1.0 factor),
+            # it means that band's contribution is scaled by 1.
+            pass # The filtered component will be added with its gain.
+
+        # Ensure frequencies are within Nyquist limit
+        if high >= framerate / 2: high = framerate / 2 - 1
+        if low >= high: low = high / 2 # avoid issues if low > high after adjustment
+
+        if low <= 0 : low = 1 # avoid issues with 0Hz
+
+        if low >= high: # Skip if band is invalid
+            for ch_idx in range(n_channels):
+                 eq_data[:, ch_idx] += audio_data_np[:, ch_idx] * gain_val # Fallback: apply gain to whole signal (not ideal)
+            continue
+
+        b, a = scipy.signal.butter(2, [low / (framerate / 2), high / (framerate / 2)], btype='band')
+        for ch_idx in range(n_channels):
+            filtered_band = scipy.signal.lfilter(b, a, audio_data_np[:, ch_idx])
+            eq_data[:, ch_idx] += filtered_band * gain_val
+
+    # Normalization: Handled after all effects, before converting to int16
+    # The output here is float.
+    return eq_data
+
 
 class VideoPlayerModule(Module):
     def __init__(self, master, shared_state, module_name="VideoPlayer", gui_manager=None):
@@ -312,7 +464,14 @@ class VideoPlayerModule(Module):
             # For now, we'll let it proceed, and audio functions will likely fail.
 
         self.volume_var = tk.DoubleVar(value=100)
-        # self.set_volume(self.volume_var.get()) # Call this after UI is created if mixer is available
+        self.effect_settings = {
+            "device_sim": "無",
+            "echo_cancellation": False,
+            "noise_reduction": False,
+            "eq_mode": "無",
+            "environment_sim": "無",
+            "player_placement": "無",
+        }
 
         self.create_ui() # Call to build the UI within self.frame
         # self.root.protocol("WM_DELETE_WINDOW", self.on_closing) # Replaced by on_destroy
@@ -395,44 +554,57 @@ class VideoPlayerModule(Module):
         self.progress_label = tk.Label(control_frame, text="請選擇檔案或資料夾", fg="blue")
         self.progress_label.pack(side=tk.LEFT, padx=20, fill=tk.X, expand=True)
 
-        # Equalizer controls with vertical scrollbar
-        eq_frame_outer = tk.LabelFrame(self.frame, text="等化器") # Parent is self.frame
-        eq_frame_outer.pack(fill=tk.X, padx=10, pady=5)
+        # Effects Button
+        effects_button_frame = tk.Frame(self.frame)
+        effects_button_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.btn_add_effects = ttk.Button(effects_button_frame, text="音訊效果設定", command=self.open_effects_dialog)
+        self.btn_add_effects.pack(pady=5, padx=10)
 
-        # Create a canvas and a vertical scrollbar for the eq_frame
-        eq_canvas_container = tk.Canvas(eq_frame_outer, height=90)  # Adjust height as needed
-        eq_scrollbar = ttk.Scrollbar(eq_frame_outer, orient="vertical", command=eq_canvas_container.yview)
-        eq_canvas_container.configure(yscrollcommand=eq_scrollbar.set)
-        eq_canvas_container.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        eq_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Frame inside the canvas to hold the actual EQ widgets
-        eq_frame = tk.Frame(eq_canvas_container)
-        eq_canvas_container.create_window((0, 0), window=eq_frame, anchor="nw")
-
-        # Bind to configure scrollregion
-        def _on_eq_frame_configure(event):
-            eq_canvas_container.configure(scrollregion=eq_canvas_container.bbox("all"))
-        eq_frame.bind("<Configure>", _on_eq_frame_configure)
-
-        # Mouse wheel scroll support
-        def _on_mousewheel(event):
-            eq_canvas_container.yview_scroll(int(-1*(event.delta/120)), "units")
-        eq_frame.bind("<Enter>", lambda e: eq_canvas_container.bind_all("<MouseWheel>", _on_mousewheel))
-        eq_frame.bind("<Leave>", lambda e: eq_canvas_container.unbind_all("<MouseWheel>"))
-
-        eq_options = list(EQ_PRESETS.keys())
-        self.eq_mode_var = tk.StringVar(value="無")
-        self.eq_menu = ttk.Combobox(eq_frame, values=eq_options, textvariable=self.eq_mode_var, state="readonly", width=15)
-        self.eq_menu.pack(side=tk.LEFT, padx=10)
-        self.eq_menu.bind("<<ComboboxSelected>>", self.on_eq_mode_change)
-        self.eq_canvas = tk.Label(eq_frame)
-        self.eq_canvas.pack(side=tk.LEFT, padx=10)
-        self.eq_gains = get_equalizer_gains("無") # Initial gains
-        self.eq_image = None # To hold PhotoImage reference
-        self.draw_equalizer_visualization()
+        # Placeholder for the old EQ visualization logic if needed, or remove completely
+        # For now, we assume EQ visualization is only in the dialog.
+        # If a small preview is desired on the main UI, it needs to be re-added carefully.
 
         self.shared_state.log("VideoPlayerModule UI created.", level=logging.INFO)
+
+    def open_effects_dialog(self):
+        # Ensure this method is defined in VideoPlayerModule
+        dialog = EffectsDialog(self)
+        # The dialog will call self.apply_new_effect_settings when "OK" is pressed.
+        # self.frame.wait_window(dialog) # Optional: wait for dialog to close
+
+    def apply_new_effect_settings(self, new_settings):
+        self.shared_state.log(f"New effect settings received: {new_settings}", level=logging.INFO)
+
+        # Check if settings actually changed to avoid unnecessary reprocessing
+        changed = False
+        for key, value in new_settings.items():
+            if self.effect_settings.get(key) != value:
+                changed = True
+                break
+
+        if changed:
+            self.effect_settings.update(new_settings)
+            self.shared_state.log(f"Effect settings updated to: {self.effect_settings}", level=logging.INFO)
+
+            # If a video is loaded, stop it and replay with new effects
+            if self.playlist and self.current_playlist_index != -1:
+                self.shared_state.log("Applying new effects: Restarting current video.", level=logging.INFO)
+                current_video_path = self.playlist[self.current_playlist_index]
+                current_time = 0
+                if self.is_playing or self.is_paused:
+                    if self.fps > 0 and self.current_frame_idx >=0:
+                        current_time = self.current_frame_idx / self.fps
+
+                self.stop_video()
+                # We need to preserve the current video and its playback time.
+                # play_current_video_in_playlist will play from start.
+                # We'll need to adjust this or add a way to start from a specific time.
+                # For now, it will restart the video.
+                self.play_current_video_in_playlist()
+                # TODO: Add logic to seek to 'current_time' after video preparation if it was playing.
+        else:
+            self.shared_state.log("Effect settings unchanged. No reprocessing needed.", level=logging.INFO)
+
 
     def on_destroy(self):
         self.shared_state.log(f"VideoPlayerModule {self.module_name} on_destroy called.", level=logging.INFO)
@@ -526,54 +698,206 @@ class VideoPlayerModule(Module):
 
         self.play_current_video_in_playlist()
 
-    def extract_audio(self, video_path_to_extract): # Renamed parameter to avoid conflict
+    def extract_audio(self, video_path_to_extract):
         self.cleanup_temp_cache()
         try:
             video_dir = os.path.dirname(video_path_to_extract)
             self.temp_cache_dir = tempfile.mkdtemp(prefix='.vidplayer_cache_', dir=video_dir)
             self.shared_state.log(f"Created temp cache directory: {self.temp_cache_dir}", level=logging.DEBUG)
 
-            temp_wav_path = os.path.join(self.temp_cache_dir, "temp.wav")
-            with VideoFileClip(video_path_to_extract) as video: # Use renamed parameter
+            # 1. Extract audio to NumPy array
+            with VideoFileClip(video_path_to_extract) as video:
                 if video.audio is None:
-                    raise Exception("Video does not contain an audio track.")
-                video.audio.write_audiofile(temp_wav_path, codec='pcm_s16le', logger=None)
+                    self.shared_state.log("Video does not contain an audio track. Cannot process audio effects.", level=logging.WARNING)
+                    # To allow video playback (though silent), we might need to create a dummy silent audio path.
+                    # For now, if there's no audio, we can't create self.temp_audio_path, which prepare_video expects.
+                    # Let's create a very short silent MP3.
+                    silent_mp3_path = os.path.join(self.temp_cache_dir, "silent_audio.mp3")
+                    # Use ffmpeg to create a short silent mp3
+                    cmd_silent = f'ffmpeg -y -loglevel error -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 -t 0.1 "{silent_mp3_path}"'
+                    os.system(cmd_silent)
+                    if os.path.exists(silent_mp3_path):
+                        self.temp_audio_path = silent_mp3_path
+                        self.shared_state.log(f"No audio in video. Created silent MP3: {self.temp_audio_path}", level=logging.INFO)
+                        return self.temp_audio_path
+                    else:
+                        raise Exception("Video does not contain an audio track, and failed to create silent fallback.")
 
-            eq_mode = self.eq_mode_var.get()
-            processed_wav_path = temp_wav_path
-            if eq_mode and eq_mode != "無":
-                eq_path = os.path.join(self.temp_cache_dir, "temp_eq.wav")
-                apply_equalizer(temp_wav_path, eq_path, get_equalizer_gains(eq_mode))
-                processed_wav_path = eq_path
+                audio_data_np = video.audio.to_soundarray(fps=44100, nbytes=4, stereo=True, logger=None)
+                framerate = 44100
+                n_channels = audio_data_np.shape[1] if len(audio_data_np.shape) > 1 else 1
+
+            self.shared_state.log(f"Audio loaded: {audio_data_np.shape}, dtype: {audio_data_np.dtype}, rate: {framerate}, ch: {n_channels}", level=logging.DEBUG)
+
+            if not audio_data_np.flags['C_CONTIGUOUS']:
+                audio_data_np = np.ascontiguousarray(audio_data_np)
+
+            # --- Apply effects sequentially ---
+            # 2. Simulate Recording Device (Placeholder)
+            device_sim_mode = self.effect_settings.get("device_sim", "無")
+            if device_sim_mode != "無":
+                self.shared_state.log(f"Applying Device Sim: {device_sim_mode} (Placeholder)", level=logging.INFO)
+                # audio_data_np = self.apply_device_simulation_effect(audio_data_np, framerate, n_channels, device_sim_mode)
+                pass # Placeholder
+
+            # 3. Echo Cancellation (Placeholder)
+            if self.effect_settings.get("echo_cancellation", False):
+                self.shared_state.log("Applying Echo Cancellation (Placeholder)", level=logging.INFO)
+                # audio_data_np = self.apply_echo_cancellation_effect(audio_data_np, framerate, n_channels)
+                pass # Placeholder
+
+            # 4. Noise Reduction (Placeholder)
+            if self.effect_settings.get("noise_reduction", False):
+                self.shared_state.log("Applying Noise Reduction (Placeholder)", level=logging.INFO)
+                # audio_data_np = self.apply_noise_reduction_effect(audio_data_np, framerate, n_channels)
+                pass # Placeholder
+
+            # 5. Equalizer
+            eq_mode = self.effect_settings.get("eq_mode", "無")
+            if eq_mode != "無":
+                self.shared_state.log(f"Applying EQ: {eq_mode}", level=logging.INFO)
+                eq_gains = get_equalizer_gains(eq_mode)
+                audio_data_np = apply_equalizer_np(audio_data_np, framerate, n_channels, eq_gains)
+
+            # 6. Playback Environment & Player Placement (pyroomacoustics)
+            environment_sim = self.effect_settings.get("environment_sim", "無")
+            if environment_sim != "無":
+                audio_data_np = self.apply_environment_effect(audio_data_np, framerate, n_channels, environment_sim, self.effect_settings.get("player_placement", "無"))
+
+            # Normalize final audio_data_np (float32) then convert to int16 for WAV
+            if audio_data_np is not None and audio_data_np.size > 0 : # Check if audio_data_np is valid
+                if np.max(np.abs(audio_data_np)) > 1e-6: # Avoid division by zero or near-zero
+                     audio_data_np = audio_data_np / np.max(np.abs(audio_data_np))
+                audio_data_int16 = (audio_data_np * 32767).astype(np.int16)
+            else: # Fallback to silent if something went wrong
+                self.shared_state.log("Audio data is None or empty after effects, creating silent audio.", level=WARNING)
+                audio_data_int16 = np.zeros((framerate // 10, n_channels), dtype=np.int16) # 0.1s silence
+
+
+            processed_wav_path = os.path.join(self.temp_cache_dir, "processed_audio.wav")
+            with wave.open(processed_wav_path, 'wb') as wf_out:
+                wf_out.setnchannels(n_channels)
+                wf_out.setsampwidth(2) # 16-bit
+                wf_out.setframerate(framerate)
+                wf_out.writeframes(audio_data_int16.tobytes())
             
             self.temp_audio_path = os.path.join(self.temp_cache_dir, "audio.mp3")
-            cmd = f'ffmpeg -y -loglevel error -i "{processed_wav_path}" -vn -ar 44100 -ac 2 -b:a 192k "{self.temp_audio_path}"'
+            # Ensure framerate and channels for ffmpeg are from the potentially modified audio_data_np
+            final_framerate = framerate
+            final_n_channels = n_channels # Could change if PRA outputs different channel count
 
-            # Check if ffmpeg exists before running
+            cmd = f'ffmpeg -y -loglevel error -i "{processed_wav_path}" -vn -ar {final_framerate} -ac {final_n_channels} -b:a 192k "{self.temp_audio_path}"'
+
             ffmpeg_exists = (os.system('ffmpeg -version > nul 2>&1') == 0 or
                              os.system('ffmpeg -version > /dev/null 2>&1') == 0)
             if not ffmpeg_exists:
-                self.shared_state.log("FFmpeg not found. Cannot extract audio to MP3.", level=logging.ERROR)
-                messagebox.showerror("FFmpeg Error", "FFmpeg is not installed or not in PATH. Audio extraction to MP3 will fail.", parent=self.frame.winfo_toplevel())
-                # Fallback: try to use the processed WAV directly if possible, or handle error
-                # For simplicity now, we'll let it fail if ffmpeg is needed for MP3.
-                # Alternatively, could try playing the WAV if pygame supports it well enough.
-                # However, the original code implies MP3 is preferred.
-                raise Exception("FFmpeg not found, cannot convert to MP3.")
+                self.shared_state.log("FFmpeg not found.", level=logging.ERROR)
+                messagebox.showerror("FFmpeg Error", "FFmpeg is not installed or not in PATH.", parent=self.frame.winfo_toplevel())
+                raise Exception("FFmpeg not found.")
 
-            os.system(cmd) # This might still fail if ffmpeg has issues, but we've checked for existence
+            ret_code = os.system(cmd)
+            if ret_code != 0:
+                 raise Exception(f"FFmpeg command failed with code {ret_code}. Command: {cmd}")
 
             if not os.path.exists(self.temp_audio_path) or os.path.getsize(self.temp_audio_path) == 0:
-                raise Exception(f"FFmpeg failed to create or created an empty audio file: {self.temp_audio_path}")
+                raise Exception(f"FFmpeg failed to create/output empty file: {self.temp_audio_path}")
 
-            self.shared_state.log(f"Audio extracted: {self.temp_audio_path}", level=logging.INFO)
+            self.shared_state.log(f"Audio processed: {self.temp_audio_path}", level=logging.INFO)
             return self.temp_audio_path
         except Exception as e:
-            self.shared_state.log(f"Error extracting audio: {e}", level=logging.ERROR)
-            self.cleanup_temp_cache() # Ensure cleanup on error
-            raise # Re-raise the exception to be caught by the caller (prepare_video)
+            self.shared_state.log(f"Error in extract_audio: {e}", level=logging.ERROR)
+            # import traceback # For more detailed debugging if needed
+            # self.shared_state.log(traceback.format_exc(), level=logging.ERROR)
+            self.cleanup_temp_cache()
+            raise
 
-    # on_closing is removed, replaced by on_destroy
+    def apply_environment_effect(self, audio_data_np, framerate, n_channels, environment_sim, player_placement):
+        self.shared_state.log(f"PRA: Env: {environment_sim}, Place: {player_placement}, InShape: {audio_data_np.shape}", level=logging.DEBUG)
+        try:
+            # Define room parameters based on selection
+            room_dim_map = {
+                "小房間": ([4, 3, 2.5], 0.25, 3), "浴室": ([3, 2, 2.5], 0.1, 5),
+                "教室": ([10, 8, 3], 0.3, 5), "音樂廳": ([40, 25, 15], 0.35, 7),
+                "廢棄廠房": ([50, 30, 10], 0.5, 5), "錄音室": ([6, 4, 3], 0.15, 3), # More absorption
+                "會議室": ([8, 6, 3], 0.28, 3), "地下道": ([20, 3, 3], 0.05, 7), # Very reverberant
+                "劇場前排": ([25, 30, 12], 0.4, 7), "戶外": (None, None, 0), # Special case for outdoor
+                "車內": ([2, 1.5, 1.2], 0.4, 2), "購物中心中庭": ([60, 40, 20], 0.6, 7)
+            }
+            if environment_sim not in room_dim_map:
+                self.shared_state.log(f"Unknown environment: {environment_sim}. Skipping.", level=logging.WARNING)
+                return audio_data_np
+
+            if environment_sim == "戶外":
+                self.shared_state.log("Applying Outdoor effect (direct sound, no reverb).", level=logging.INFO)
+                # For "戶外", we essentially want to bypass room simulation or use one with max absorption.
+                # Simplest is to return the signal as is, or with very slight attenuation if desired.
+                return audio_data_np # Or a more sophisticated anechoic simulation
+
+            room_dim, absorption_coeff, max_order = room_dim_map[environment_sim]
+
+            # Pyroomacoustics expects mono source signals for typical ShoeBox setup.
+            # If stereo input, take the left channel or average.
+            if n_channels > 1:
+                source_signal_pra = np.ascontiguousarray(audio_data_np[:, 0]) # Use left channel
+            else:
+                source_signal_pra = np.ascontiguousarray(audio_data_np.flatten())
+
+            # Create ShoeBox room
+            room = pra.ShoeBox(room_dim, fs=framerate, materials=pra.Material(absorption_coeff), max_order=max_order)
+
+            # Source position
+            center_x, center_y, center_z = room_dim[0]/2, room_dim[1]/2, min(1.5, room_dim[2]/2)
+            src_pos_map = {
+                "無": [center_x, center_y, center_z],
+                "前方": [center_x, 1.0, center_z], # Listener at [center_x, room_dim[1]-1, center_z]
+                "後方": [center_x, room_dim[1]-1.0, center_z],
+                "左方": [1.0, center_y, center_z],
+                "右方": [room_dim[0]-1.0, center_y, center_z],
+                "上方": [center_x, center_y, room_dim[2]-0.5],
+                "下方": [center_x, center_y, 0.5],
+                "360度環繞": [center_x, center_y, center_z] # Placeholder, needs more complex setup
+            }
+            source_position = src_pos_map.get(player_placement, src_pos_map["無"])
+            # Ensure source is within room boundaries
+            source_position[0] = np.clip(source_position[0], 0.1, room_dim[0]-0.1)
+            source_position[1] = np.clip(source_position[1], 0.1, room_dim[1]-0.1)
+            source_position[2] = np.clip(source_position[2], 0.1, room_dim[2]-0.1)
+            room.add_source(source_position, signal=source_signal_pra)
+
+            # Microphone array (stereo) - Listener position assumed to be somewhat central or opposite to "前方"
+            # Let's place listener mics based on 'front' being along Y-axis negative direction from source if source is 'front'
+            mic_base_pos = [center_x, room_dim[1] * 0.75, center_z] # Default listener position
+            if player_placement == "前方": # Source is at Y=1, listener further back
+                 mic_base_pos = [center_x, room_dim[1] -1.0, center_z]
+
+            mic_base_pos[0] = np.clip(mic_base_pos[0], 0.1, room_dim[0]-0.1)
+            mic_base_pos[1] = np.clip(mic_base_pos[1], 0.1, room_dim[1]-0.1)
+            mic_base_pos[2] = np.clip(mic_base_pos[2], 0.1, room_dim[2]-0.1)
+
+            mic_offset = 0.1 # 10cm mic separation for stereo
+            mic_positions = np.c_[
+                [mic_base_pos[0] - mic_offset, mic_base_pos[1], mic_base_pos[2]],  # Left mic
+                [mic_base_pos[0] + mic_offset, mic_base_pos[1], mic_base_pos[2]],  # Right mic
+            ]
+            room.add_microphone_array(mic_positions)
+
+            room.simulate()
+            simulated_audio_stereo = room.mic_array.signals.T # (n_samples, n_mics)
+
+            # Ensure output is stereo, even if input was mono
+            if simulated_audio_stereo.shape[1] == 1: # Should be 2 due to mic_positions
+                 simulated_audio_stereo = np.tile(simulated_audio_stereo, (1,2))
+
+
+            self.shared_state.log(f"PRA Output: {simulated_audio_stereo.shape}", level=logging.DEBUG)
+            return simulated_audio_stereo
+
+        except Exception as pra_e:
+            self.shared_state.log(f"Pyroomacoustics processing error: {pra_e}", level=logging.ERROR)
+            # import traceback
+            # self.shared_state.log(traceback.format_exc(), level=logging.DEBUG)
+            return audio_data_np # Fallback to original audio if PRA fails
+
 
     def open_jump_to_window(self):
         if not self.playlist: return

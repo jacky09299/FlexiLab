@@ -1,0 +1,32 @@
+# Standard Python libraries often included in Conda environments,
+# but generally not needed in requirements.txt for pip if using a standard Python install:
+# setuptools
+# sqlite # usually part of Python standard library or system installed
+# vc # Windows specific C runtime, handled by Python installer
+# vs2015_runtime # Windows specific, handled by Python installer
+# wheel
+# wincertstore # Windows specific
+
+# Core dependencies that are pip-installable
+certifi
+tk
+Pillow
+pygame
+moviepy
+opencv-python
+matplotlib
+numpy
+scipy
+requests
+beautifulsoup4
+yt-dlp
+PyPDF2
+reportlab
+tkcalendar
+psutil
+# spectral # This might be 'spectral-cube' or another variant, needs confirmation if used
+# pandas
+# pyfiglet
+
+# New dependency
+pyroomacoustics
